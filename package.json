@@ -1,0 +1,32 @@
+{
+  "name": "zai-coding-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "bin": {
+    "my-agent": "./dist/index.js"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^5.3.2",
+    "boxen": "^7.1.1",
+    "chalk": "^5.3.0",
+    "cli-highlight": "^2.1.11",
+    "commander": "^12.1.0",
+    "diff": "^5.2.0",
+    "dotenv": "^16.4.5",
+    "ignore": "^5.3.2",
+    "openai": "^4.71.0",
+    "ora": "^8.1.1",
+    "wrap-ansi": "^8.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/diff": "^5.2.0",
+    "@types/node": "^22.10.7",
+    "typescript": "^5.6.3"
+  }
+}
