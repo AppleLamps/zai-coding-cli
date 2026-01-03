@@ -5,11 +5,13 @@ import { highlight } from "cli-highlight";
 import ora, { type Ora } from "ora";
 import wrapAnsi from "wrap-ansi";
 import { modeManager } from "../core/modes.js";
+import { getToolDisplayName } from "../core/tool-registry.js";
 
 export type Verbosity = "minimal" | "normal" | "verbose";
 
 type TerminalOptions = {
   verbosity?: Verbosity;
+  useAsciiEmoji?: boolean;
 };
 
 type StatusBarState = {
@@ -31,25 +33,36 @@ type BoxOptions = {
   borderColor: string;
 };
 
-// Tool name mapping to Claude Code style
-const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  read_file: "Read",
-  write_file: "Write",
-  edit_file: "Edit",
-  multi_edit: "MultiEdit",
-  run_command: "Bash",
-  list_files: "List",
-  glob_files: "Glob",
-  search_project: "Grep",
-  git_commit: "Bash",
-  web_search: "WebSearch",
-  read_url: "WebFetch"
+/**
+ * ASCII alternatives for emoji (for terminals that don't support emoji)
+ */
+const ASCII_EMOJI: Record<string, string> = {
+  "⚡": "[*]",
+  "⚠": "[!]",
+  "✓": "[v]",
+  "✗": "[x]",
+  "→": "->",
+  "•": "*",
+  "└": "`-",
+  "💭": "[?]"
 };
+
+/**
+ * Replace emoji with ASCII equivalents
+ */
+function toAscii(text: string): string {
+  let result = text;
+  for (const [emoji, ascii] of Object.entries(ASCII_EMOJI)) {
+    result = result.replaceAll(emoji, ascii);
+  }
+  return result;
+}
 
 export class TerminalUI {
   private rl: readline.Interface;
   private spinner: Ora | null = null;
   private verbosity: Verbosity;
+  private useAsciiEmoji: boolean;
   private buffer = "";
   private isPrompting = false;
   private assistantActive = false;
@@ -64,6 +77,7 @@ export class TerminalUI {
 
   constructor(options: TerminalOptions = {}) {
     this.verbosity = options.verbosity ?? "normal";
+    this.useAsciiEmoji = options.useAsciiEmoji ?? this.detectAsciiMode();
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -231,7 +245,7 @@ export class TerminalUI {
     this.hideStatusBar();
     const displayName = this.formatToolName(toolName);
     const formattedName = chalk.bold(displayName);
-    console.log(`• ${formattedName} ${chalk.dim(target)}`);
+    console.log(this.emit(`• ${formattedName} ${chalk.dim(target)}`));
   }
 
   /**
@@ -243,7 +257,7 @@ export class TerminalUI {
     // Show thinking in italic gray with a thought bubble indicator
     const lines = thought.split("\n");
     for (const line of lines) {
-      console.log(chalk.gray.italic(`  💭 ${line}`));
+      console.log(chalk.gray.italic(this.emit(`  💭 ${line}`)));
     }
   }
 
@@ -262,7 +276,7 @@ export class TerminalUI {
   writeToolResult(result: string) {
     if (!result) return;
     this.hideStatusBar();
-    console.log(chalk.dim(`  └ ${result}`));
+    console.log(chalk.dim(this.emit(`  └ ${result}`)));
   }
 
   /**
@@ -274,7 +288,7 @@ export class TerminalUI {
     const visible = lines.slice(0, maxLines);
     for (let i = 0; i < visible.length; i++) {
       const prefix = i === 0 ? "└" : " ";
-      console.log(chalk.dim(`  ${prefix} ${visible[i]}`));
+      console.log(chalk.dim(this.emit(`  ${prefix} ${visible[i]}`)));
     }
     if (lines.length > maxLines) {
       console.log(chalk.dim(`    ... ${lines.length - maxLines} more lines`));
@@ -285,7 +299,31 @@ export class TerminalUI {
    * Format tool name to Claude Code style display name
    */
   formatToolName(name: string): string {
-    return TOOL_DISPLAY_NAMES[name] || name;
+    return getToolDisplayName(name);
+  }
+
+  /**
+   * Emit text, converting emoji to ASCII if needed
+   */
+  private emit(text: string): string {
+    return this.useAsciiEmoji ? toAscii(text) : text;
+  }
+
+  /**
+   * Detect if we should use ASCII mode (no emoji support)
+   */
+  private detectAsciiMode(): boolean {
+    // Check TERM for known limited terminals
+    const term = process.env.TERM ?? "";
+    if (term === "dumb" || term === "linux") {
+      return true;
+    }
+    // Check for explicit preference
+    if (process.env.ZAI_ASCII === "1") {
+      return true;
+    }
+    // Default to emoji support
+    return false;
   }
 
   writeDiff(diff: string, _title = "Proposed Edit") {
@@ -383,7 +421,7 @@ export class TerminalUI {
     // Render in nested tree style
     const outputLines = content.split(/\r?\n/);
     for (let i = 0; i < outputLines.length; i++) {
-      const prefix = i === 0 ? "└" : " ";
+      const prefix = i === 0 ? this.emit("└") : " ";
       console.log(chalk.dim(`  ${prefix} ${outputLines[i]}`));
     }
 
@@ -408,12 +446,12 @@ export class TerminalUI {
     // Use inline format with warning indicator
     const icon =
       tone === "danger"
-        ? chalk.red("⚠")
+        ? chalk.red(this.emit("⚠"))
         : tone === "warn"
-          ? chalk.yellow("⚠")
+          ? chalk.yellow(this.emit("⚠"))
           : tone === "safe"
-            ? chalk.green("→")
-            : chalk.blue("•");
+            ? chalk.green(this.emit("→"))
+            : chalk.blue(this.emit("•"));
 
     const label =
       tone === "danger"
@@ -581,7 +619,7 @@ export class TerminalUI {
           ? chalk.yellow
           : chalk.green;
     const parts = [
-      usageColor(`⚡ ${tokens}`),
+      usageColor(this.emit(`⚡ ${tokens}`)),
       chalk.dim(`in ${format(state.promptTokens)}`),
       chalk.dim(`out ${format(state.completionTokens)}`),
       chalk.dim(`$${state.cost ?? "0.00"}`),
@@ -642,9 +680,9 @@ export class TerminalUI {
     }
     this.hideStatusBar();
     const icons = {
-      start: chalk.cyan("→"),
-      success: chalk.green("✓"),
-      info: chalk.blue("•"),
+      start: chalk.cyan(this.emit("→")),
+      success: chalk.green(this.emit("✓")),
+      info: chalk.blue(this.emit("•")),
       warn: chalk.yellow("!")
     };
     const icon = icons[state] ?? icons.info;
