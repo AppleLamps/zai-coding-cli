@@ -52,7 +52,6 @@ type AgentOptions = {
   onToolEnd?: (message: string) => void;
   onToolAction?: (info: ToolActionInfo) => void;
   onToolResult?: (result: string) => void;
-  onThinking?: (thought: string) => void;
 };
 
 type FunctionToolCall = Extract<
@@ -74,7 +73,6 @@ export class Agent {
   private onToolEnd?: (message: string) => void;
   private onToolAction?: (info: ToolActionInfo) => void;
   private onToolResult?: (result: string) => void;
-  private onThinking?: (thought: string) => void;
   private systemPromptOverride?: string;
   private trustLevel: TrustLevel;
   private backupService: BackupService;
@@ -105,7 +103,6 @@ export class Agent {
     this.onToolEnd = options.onToolEnd;
     this.onToolAction = options.onToolAction;
     this.onToolResult = options.onToolResult;
-    this.onThinking = options.onThinking;
     this.systemPromptOverride = options.systemPrompt;
     this.trustLevel = options.trustLevel ?? "standard";
     this.backupService = new BackupService(options.projectRoot ?? process.cwd());

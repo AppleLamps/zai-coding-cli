@@ -3,6 +3,8 @@ import * as fsSync from "node:fs";
 import path from "node:path";
 import ignoreModule, { type Ignore, type Options } from "ignore";
 import { createTwoFilesPatch } from "diff";
+import micromatch from "micromatch";
+import { GlobPatternError } from "../core/errors.js";
 
 type ListFilesArgs = {
   path?: string;
@@ -101,19 +103,63 @@ export class FSService {
   }
 
   /**
-   * Find files matching a glob pattern
+   * Validate glob pattern for safety and correctness
+   */
+  private validateGlobPattern(pattern: string): void {
+    // Check for empty pattern
+    if (!pattern || !pattern.trim()) {
+      throw new GlobPatternError("Glob pattern cannot be empty", pattern);
+    }
+
+    // Check for control characters
+    const invalidChars = /[\x00-\x1f]/;
+    if (invalidChars.test(pattern)) {
+      throw new GlobPatternError("Invalid control characters in pattern", pattern);
+    }
+
+    // Check for unbalanced brackets
+    const openBrackets = (pattern.match(/\[/g) || []).length;
+    const closeBrackets = (pattern.match(/\]/g) || []).length;
+    if (openBrackets !== closeBrackets) {
+      throw new GlobPatternError("Unbalanced brackets in pattern", pattern);
+    }
+
+    // Check for unbalanced braces
+    const openBraces = (pattern.match(/\{/g) || []).length;
+    const closeBraces = (pattern.match(/\}/g) || []).length;
+    if (openBraces !== closeBraces) {
+      throw new GlobPatternError("Unbalanced braces in pattern", pattern);
+    }
+  }
+
+  /**
+   * Find files matching a glob pattern using micromatch
    */
   async globFiles(args: { pattern: string; path?: string }): Promise<string> {
+    const pattern = args.pattern;
+
+    // Validate pattern before use
+    this.validateGlobPattern(pattern);
+
     const basePath = args.path
       ? await this.resolvePath(args.path)
       : this.rootDir;
-    const pattern = args.pattern;
+
     const ig = await this.buildIgnore();
-    const matches: string[] = [];
 
-    await this.walkGlob(basePath, pattern, ig, matches);
+    // Collect all files first
+    const allFiles = await this.collectAllFiles(basePath, ig);
 
-    if (matches.length === 0) {
+    // Convert to relative paths for matching
+    const relativePaths = allFiles.map((f) => this.toRelative(f));
+
+    // Use micromatch for proper glob matching
+    const matchedRelative = micromatch(relativePaths, pattern, {
+      dot: true,
+      matchBase: !pattern.includes("/")
+    });
+
+    if (matchedRelative.length === 0) {
       return JSON.stringify({
         pattern,
         basePath: this.toRelative(basePath),
@@ -124,12 +170,13 @@ export class FSService {
 
     // Sort by modification time (newest first)
     const withStats = await Promise.all(
-      matches.map(async (filePath) => {
+      matchedRelative.map(async (relPath) => {
+        const fullPath = path.join(this.rootDir, relPath);
         try {
-          const stats = await fs.stat(filePath);
-          return { path: this.toRelative(filePath), mtime: stats.mtime.getTime() };
+          const stats = await fs.stat(fullPath);
+          return { path: relPath, mtime: stats.mtime.getTime() };
         } catch {
-          return { path: this.toRelative(filePath), mtime: 0 };
+          return { path: relPath, mtime: 0 };
         }
       })
     );
@@ -145,60 +192,46 @@ export class FSService {
   }
 
   /**
-   * Walk directory and match files against glob pattern
+   * Collect all files in a directory (respecting ignore rules)
    */
-  private async walkGlob(
+  private async collectAllFiles(
     dir: string,
-    pattern: string,
     ig: Ignore,
-    matches: string[],
-    maxMatches = 500
-  ): Promise<void> {
-    if (matches.length >= maxMatches) return;
+    maxFiles = 5000
+  ): Promise<string[]> {
+    const files: string[] = [];
+    const stack = [dir];
 
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
+    while (stack.length > 0 && files.length < maxFiles) {
+      const current = stack.pop();
+      if (!current) continue;
 
-      for (const entry of entries) {
-        if (matches.length >= maxMatches) break;
+      try {
+        const entries = await fs.readdir(current, { withFileTypes: true });
 
-        const fullPath = path.join(dir, entry.name);
-        const relativePath = this.toRelative(fullPath);
+        for (const entry of entries) {
+          if (files.length >= maxFiles) break;
 
-        if (ig.ignores(relativePath)) continue;
+          const fullPath = path.join(current, entry.name);
+          const relativePath = this.toRelative(fullPath);
 
-        if (entry.isDirectory()) {
-          await this.walkGlob(fullPath, pattern, ig, matches, maxMatches);
-        } else if (entry.isFile()) {
-          if (this.matchGlob(relativePath, pattern)) {
-            matches.push(fullPath);
+          if (ig.ignores(relativePath)) continue;
+
+          if (entry.isDirectory()) {
+            // Don't ignore directories for traversal
+            if (!ig.ignores(`${relativePath}/`)) {
+              stack.push(fullPath);
+            }
+          } else if (entry.isFile()) {
+            files.push(fullPath);
           }
         }
+      } catch {
+        // Skip directories we can't read
       }
-    } catch {
-      // Skip directories we can't read
-    }
-  }
-
-  /**
-   * Simple glob matching (supports *, **, ?)
-   */
-  private matchGlob(filePath: string, pattern: string): boolean {
-    // Convert glob pattern to regex
-    let regexPattern = pattern
-      .replace(/\./g, "\\.")
-      .replace(/\*\*/g, "{{GLOBSTAR}}")
-      .replace(/\*/g, "[^/]*")
-      .replace(/\?/g, ".")
-      .replace(/{{GLOBSTAR}}/g, ".*");
-
-    // Handle patterns that don't start with ** or path
-    if (!pattern.startsWith("*") && !pattern.startsWith("/")) {
-      regexPattern = `(^|/)${regexPattern}`;
     }
 
-    const regex = new RegExp(`${regexPattern}$`, "i");
-    return regex.test(filePath);
+    return files;
   }
 
   async generateFileTree(maxDepth = 3) {

@@ -71,8 +71,7 @@ const main = async (options: CliOptions) => {
       },
       // New Claude Code style callbacks
       onToolAction: (info) => ui.writeToolAction(info.toolName, info.target),
-      onToolResult: (result) => ui.writeToolResult(result),
-      onThinking: (thought) => ui.writeThinking(thought)
+      onToolResult: (result) => ui.writeToolResult(result)
     }
   );
 
