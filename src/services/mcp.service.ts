@@ -185,6 +185,57 @@ export class MCPService {
             additionalProperties: false
           }
         }
+      },
+      {
+        type: "function",
+        function: {
+          name: "glob_files",
+          description:
+            "Find files matching a glob pattern (e.g., '**/*.ts', 'src/**/*.tsx'). Returns matching file paths.",
+          parameters: {
+            type: "object",
+            properties: {
+              pattern: {
+                type: "string",
+                description: "Glob pattern to match files (e.g., '**/*.ts', 'src/components/*.tsx')"
+              },
+              path: {
+                type: "string",
+                description: "Base directory to search from (default: current directory)"
+              }
+            },
+            required: ["pattern"],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "multi_edit",
+          description:
+            "Apply multiple edits across one or more files in a single operation. More efficient than multiple edit_file calls.",
+          parameters: {
+            type: "object",
+            properties: {
+              edits: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    path: { type: "string", description: "File path to edit" },
+                    old_string: { type: "string", description: "Text to replace" },
+                    new_string: { type: "string", description: "Replacement text" }
+                  },
+                  required: ["path", "old_string", "new_string"]
+                },
+                description: "Array of edits to apply"
+              }
+            },
+            required: ["edits"],
+            additionalProperties: false
+          }
+        }
       }
     ];
   }
@@ -230,9 +281,74 @@ export class MCPService {
         return this.callMcp(this.searchEndpoint, "webSearchPrime", args);
       case "read_url":
         return this.callMcp(this.readerEndpoint, "webReader", args);
+      case "glob_files":
+        return this.fsService.globFiles(args as { pattern: string; path?: string });
+      case "multi_edit": {
+        const payload = args as {
+          edits: Array<{ path: string; old_string: string; new_string: string }>;
+        };
+        return this.executeMultiEdit(payload.edits);
+      }
       default:
         throw new Error(`Unsupported tool: ${name}`);
     }
+  }
+
+  /**
+   * Execute multiple edits across files
+   */
+  private async executeMultiEdit(
+    edits: Array<{ path: string; old_string: string; new_string: string }>
+  ): Promise<string> {
+    const results: string[] = [];
+    const errors: string[] = [];
+
+    for (const edit of edits) {
+      try {
+        await this.patchService.applyEdit(
+          edit.path,
+          edit.old_string,
+          edit.new_string
+        );
+        results.push(`✓ Edited ${edit.path}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`✗ Failed ${edit.path}: ${message}`);
+      }
+    }
+
+    const summary = [
+      ...results,
+      ...errors,
+      `\nTotal: ${results.length} succeeded, ${errors.length} failed`
+    ].join("\n");
+
+    return summary;
+  }
+
+  /**
+   * Preview multiple edits
+   */
+  async previewMultiEdit(
+    edits: Array<{ path: string; old_string: string; new_string: string }>
+  ): Promise<Array<{ path: string; diff: string; error?: string }>> {
+    const previews: Array<{ path: string; diff: string; error?: string }> = [];
+
+    for (const edit of edits) {
+      try {
+        const preview = await this.patchService.previewEdit(
+          edit.path,
+          edit.old_string,
+          edit.new_string
+        );
+        previews.push({ path: edit.path, diff: preview.diff });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        previews.push({ path: edit.path, diff: "", error: message });
+      }
+    }
+
+    return previews;
   }
 
   async previewWriteFile(args: { path?: string; content?: string }) {

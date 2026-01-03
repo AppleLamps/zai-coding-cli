@@ -3,6 +3,8 @@ import * as fsSync from "node:fs";
 import path from "node:path";
 import ignoreModule, { type Ignore, type Options } from "ignore";
 import { createTwoFilesPatch } from "diff";
+import micromatch from "micromatch";
+import { GlobPatternError } from "../core/errors.js";
 
 type ListFilesArgs = {
   path?: string;
@@ -98,6 +100,138 @@ export class FSService {
       diff,
       existed: existing.length > 0
     };
+  }
+
+  /**
+   * Validate glob pattern for safety and correctness
+   */
+  private validateGlobPattern(pattern: string): void {
+    // Check for empty pattern
+    if (!pattern || !pattern.trim()) {
+      throw new GlobPatternError("Glob pattern cannot be empty", pattern);
+    }
+
+    // Check for control characters
+    const invalidChars = /[\x00-\x1f]/;
+    if (invalidChars.test(pattern)) {
+      throw new GlobPatternError("Invalid control characters in pattern", pattern);
+    }
+
+    // Check for unbalanced brackets
+    const openBrackets = (pattern.match(/\[/g) || []).length;
+    const closeBrackets = (pattern.match(/\]/g) || []).length;
+    if (openBrackets !== closeBrackets) {
+      throw new GlobPatternError("Unbalanced brackets in pattern", pattern);
+    }
+
+    // Check for unbalanced braces
+    const openBraces = (pattern.match(/\{/g) || []).length;
+    const closeBraces = (pattern.match(/\}/g) || []).length;
+    if (openBraces !== closeBraces) {
+      throw new GlobPatternError("Unbalanced braces in pattern", pattern);
+    }
+  }
+
+  /**
+   * Find files matching a glob pattern using micromatch
+   */
+  async globFiles(args: { pattern: string; path?: string }): Promise<string> {
+    const pattern = args.pattern;
+
+    // Validate pattern before use
+    this.validateGlobPattern(pattern);
+
+    const basePath = args.path
+      ? await this.resolvePath(args.path)
+      : this.rootDir;
+
+    const ig = await this.buildIgnore();
+
+    // Collect all files first
+    const allFiles = await this.collectAllFiles(basePath, ig);
+
+    // Convert to relative paths for matching
+    const relativePaths = allFiles.map((f) => this.toRelative(f));
+
+    // Use micromatch for proper glob matching
+    const matchedRelative = micromatch(relativePaths, pattern, {
+      dot: true,
+      matchBase: !pattern.includes("/")
+    });
+
+    if (matchedRelative.length === 0) {
+      return JSON.stringify({
+        pattern,
+        basePath: this.toRelative(basePath),
+        matches: [],
+        count: 0
+      });
+    }
+
+    // Sort by modification time (newest first)
+    const withStats = await Promise.all(
+      matchedRelative.map(async (relPath) => {
+        const fullPath = path.join(this.rootDir, relPath);
+        try {
+          const stats = await fs.stat(fullPath);
+          return { path: relPath, mtime: stats.mtime.getTime() };
+        } catch {
+          return { path: relPath, mtime: 0 };
+        }
+      })
+    );
+
+    withStats.sort((a, b) => b.mtime - a.mtime);
+
+    return JSON.stringify({
+      pattern,
+      basePath: this.toRelative(basePath),
+      matches: withStats.map((f) => f.path),
+      count: withStats.length
+    });
+  }
+
+  /**
+   * Collect all files in a directory (respecting ignore rules)
+   */
+  private async collectAllFiles(
+    dir: string,
+    ig: Ignore,
+    maxFiles = 5000
+  ): Promise<string[]> {
+    const files: string[] = [];
+    const stack = [dir];
+
+    while (stack.length > 0 && files.length < maxFiles) {
+      const current = stack.pop();
+      if (!current) continue;
+
+      try {
+        const entries = await fs.readdir(current, { withFileTypes: true });
+
+        for (const entry of entries) {
+          if (files.length >= maxFiles) break;
+
+          const fullPath = path.join(current, entry.name);
+          const relativePath = this.toRelative(fullPath);
+
+          if (ig.ignores(relativePath)) continue;
+
+          if (entry.isDirectory()) {
+            // Don't ignore directories for traversal
+            if (!ig.ignores(`${relativePath}/`)) {
+              stack.push(fullPath);
+            }
+          } else if (entry.isFile()) {
+            files.push(fullPath);
+          }
+        }
+      } catch {
+        // Skip directories we can't read
+      }
+    }
+
+    return files;
   }
 
   async generateFileTree(maxDepth = 3) {

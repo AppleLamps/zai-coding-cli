@@ -17,11 +17,41 @@ import {
 } from "./services/llm.service.js";
 import type { SessionService, SessionState } from "./services/session.service.js";
 import type { TerminalUI } from "./ui/terminal.js";
+import { BackupService } from "./services/backup.service.js";
+
+import {
+  type TrustLevel,
+  type ToolActionInfo,
+  MultiEditArgsSchema,
+  validateToolArgs
+} from "./core/types.js";
+
+// Re-export for backwards compatibility
+export type { TrustLevel };
+
+// Tools that are safe to auto-approve in standard mode
+const SAFE_TOOLS = new Set([
+  "read_file",
+  "list_files",
+  "search_project",
+  "web_search",
+  "read_url",
+  "glob_files"  // Read-only file search
+]);
+
+// Tools that require approval even in full trust mode (destructive)
+const ALWAYS_PROMPT_TOOLS = new Set<string>([
+  // Currently empty, but could include "git_push", "delete_file" etc.
+]);
 
 type AgentOptions = {
   systemPrompt?: string;
+  trustLevel?: TrustLevel;
+  projectRoot?: string;
   onToolStart?: (message: string) => void;
   onToolEnd?: (message: string) => void;
+  onToolAction?: (info: ToolActionInfo) => void;
+  onToolResult?: (result: string) => void;
 };
 
 type FunctionToolCall = Extract<
@@ -41,7 +71,11 @@ export class Agent {
   private messages: ChatCompletionMessageParam[];
   private onToolStart?: (message: string) => void;
   private onToolEnd?: (message: string) => void;
+  private onToolAction?: (info: ToolActionInfo) => void;
+  private onToolResult?: (result: string) => void;
   private systemPromptOverride?: string;
+  private trustLevel: TrustLevel;
+  private backupService: BackupService;
   private isBusyFlag = false;
   private cancelRequested = false;
   private currentAbortController: AbortController | null = null;
@@ -67,8 +101,84 @@ export class Agent {
     this.compactionService = compactionService;
     this.onToolStart = options.onToolStart;
     this.onToolEnd = options.onToolEnd;
+    this.onToolAction = options.onToolAction;
+    this.onToolResult = options.onToolResult;
     this.systemPromptOverride = options.systemPrompt;
+    this.trustLevel = options.trustLevel ?? "standard";
+    this.backupService = new BackupService(options.projectRoot ?? process.cwd());
     this.messages = [];
+  }
+
+  /**
+   * Check if a tool requires user approval based on trust level
+   */
+  private requiresApproval(toolName: string): boolean {
+    // Always prompt for destructive tools
+    if (ALWAYS_PROMPT_TOOLS.has(toolName)) {
+      return true;
+    }
+
+    switch (this.trustLevel) {
+      case "full":
+        return false;
+      case "paranoid":
+        return true;
+      case "standard":
+      default:
+        return !SAFE_TOOLS.has(toolName);
+    }
+  }
+
+  /**
+   * Backup a file before modification for undo capability
+   */
+  private async backupFile(filePath: string): Promise<void> {
+    try {
+      const content = await this.mcp.executeTool("read_file", { path: filePath });
+      await this.backupService.backup(filePath, content);
+    } catch {
+      // File doesn't exist yet, no backup needed
+    }
+  }
+
+  /**
+   * Restore a file from backup
+   */
+  async undoFile(filePath: string): Promise<boolean> {
+    const content = await this.backupService.restore(filePath);
+    if (content === null) {
+      return false;
+    }
+    await this.mcp.executeTool("write_file", { path: filePath, content });
+    return true;
+  }
+
+  /**
+   * Get list of files that can be undone
+   */
+  getUndoableFiles(): string[] {
+    return this.backupService.getUndoableFiles();
+  }
+
+  /**
+   * Clear all file backups
+   */
+  async clearBackups(): Promise<void> {
+    await this.backupService.clearAll();
+  }
+
+  /**
+   * Get backup statistics
+   */
+  getBackupStats() {
+    return this.backupService.getStats();
+  }
+
+  /**
+   * Get backup info for a specific file
+   */
+  getBackupInfo(filePath: string) {
+    return this.backupService.getBackupInfo(filePath);
   }
 
   async run() {
@@ -133,7 +243,11 @@ export class Agent {
               break;
             }
 
-            if (toolName === "run_command") {
+            // Check if this tool requires approval based on trust level
+            const needsApproval = this.requiresApproval(toolName);
+
+            // Handle approval for dangerous operations
+            if (needsApproval && toolName === "run_command") {
               this.ui.stopSpinner();
               const command = this.extractStringArg(args, "command");
               this.ui.renderPermissionPanel(
@@ -157,7 +271,7 @@ export class Agent {
               }
             }
 
-            if (toolName === "git_commit") {
+            if (needsApproval && toolName === "git_commit") {
               this.ui.stopSpinner();
               const message = this.extractStringArg(args, "message");
               this.ui.renderPermissionPanel(
@@ -182,59 +296,138 @@ export class Agent {
             }
 
             if (toolName === "write_file") {
-              const preview = await this.mcp.previewWriteFile(
-                args as { path?: string; content?: string }
-              );
-              this.ui.stopSpinner();
-              this.ui.writeDiff(preview.diff, "Proposed Edit");
-              const target = this.extractStringArg(args, "path") || "file";
-              this.ui.renderPermissionPanel("Apply Edit", target, "safe");
+              const filePath = this.extractStringArg(args, "path");
+              // Backup file before modification for undo capability
+              if (filePath) {
+                await this.backupFile(filePath);
+              }
 
-              const approved = await confirm({
-                message: "Apply this edit?",
-                default: false
-              });
+              if (needsApproval) {
+                const preview = await this.mcp.previewWriteFile(
+                  args as { path?: string; content?: string }
+                );
+                this.ui.stopSpinner();
+                this.ui.writeDiff(preview.diff, "Proposed Edit");
+                const target = filePath || "file";
+                this.ui.renderPermissionPanel("Apply Edit", target, "safe");
 
-              if (!approved) {
-                this.messages.push({
-                  role: "tool",
-                  tool_call_id: toolCall.id,
-                  content: "User denied the operation."
+                const approved = await confirm({
+                  message: "Apply this edit?",
+                  default: false
                 });
-                this.onToolEnd?.("User denied the operation.");
-                continue;
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied the operation."
+                  });
+                  this.onToolEnd?.("User denied the operation.");
+                  continue;
+                }
               }
             }
 
             if (toolName === "edit_file") {
-              const preview = await this.mcp.previewEditFile(
-                args as {
-                  path?: string;
-                  old_string?: string;
-                  new_string?: string;
-                }
-              );
-              this.ui.stopSpinner();
-              this.ui.writeDiff(preview.diff, "Proposed Edit");
-              const target = this.extractStringArg(args, "path") || "file";
-              this.ui.renderPermissionPanel("Apply Edit", target, "safe");
+              const filePath = this.extractStringArg(args, "path");
+              // Backup file before modification for undo capability
+              if (filePath) {
+                await this.backupFile(filePath);
+              }
 
-              const approved = await confirm({
-                message: "Apply this edit?",
-                default: false
-              });
+              if (needsApproval) {
+                const preview = await this.mcp.previewEditFile(
+                  args as {
+                    path?: string;
+                    old_string?: string;
+                    new_string?: string;
+                  }
+                );
+                this.ui.stopSpinner();
+                this.ui.writeDiff(preview.diff, "Proposed Edit");
+                const target = filePath || "file";
+                this.ui.renderPermissionPanel("Apply Edit", target, "safe");
 
-              if (!approved) {
-                this.messages.push({
-                  role: "tool",
-                  tool_call_id: toolCall.id,
-                  content: "User denied the operation."
+                const approved = await confirm({
+                  message: "Apply this edit?",
+                  default: false
                 });
-                this.onToolEnd?.("User denied the operation.");
-                continue;
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied the operation."
+                  });
+                  this.onToolEnd?.("User denied the operation.");
+                  continue;
+                }
               }
             }
 
+            // Handle multi_edit with proper backups and approval
+            if (toolName === "multi_edit") {
+              // Validate args at runtime
+              const validation = validateToolArgs(MultiEditArgsSchema, args, "multi_edit");
+              if (!validation.success) {
+                this.messages.push({
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: `Error: ${validation.error}`
+                });
+                this.onToolEnd?.(validation.error);
+                continue;
+              }
+
+              const validatedArgs = validation.data;
+
+              // Backup all files that will be edited
+              for (const edit of validatedArgs.edits) {
+                await this.backupFile(edit.path);
+              }
+
+              // Show preview and get approval if needed
+              if (needsApproval) {
+                const previews = await this.mcp.previewMultiEdit(validatedArgs.edits);
+
+                this.ui.stopSpinner();
+                this.ui.writeSectionHeader(`Multi-Edit: ${validatedArgs.edits.length} files`);
+
+                for (const preview of previews) {
+                  if (preview.error) {
+                    this.ui.writeError(`  ${preview.path}: ${preview.error}`);
+                  } else {
+                    this.ui.writeMuted(`  ${preview.path}:`);
+                    this.ui.writeDiff(preview.diff);
+                  }
+                }
+
+                this.ui.renderPermissionPanel(
+                  "Apply Edits",
+                  `${validatedArgs.edits.length} files`,
+                  "warn"
+                );
+
+                const approved = await confirm({
+                  message: "Apply all edits?",
+                  default: false
+                });
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied multi-edit operation."
+                  });
+                  this.onToolEnd?.("User denied multi-edit operation.");
+                  continue;
+                }
+              }
+            }
+
+            // Display tool action in Claude Code style
+            const actionInfo = this.getToolActionInfo(toolName, args);
+            this.onToolAction?.(actionInfo);
             this.onToolStart?.(startMessage);
 
             let result = "";
@@ -260,6 +453,11 @@ export class Agent {
             if (toolName === "run_command") {
               this.ui.writeCommandOutput(result);
             }
+
+            // Display result in Claude Code style
+            const resultDisplay = this.getToolResultDisplay(toolName, args, sanitizedResult);
+            this.onToolResult?.(resultDisplay);
+
             const summary = this.summarizeToolResult(
               toolName,
               args,
@@ -497,6 +695,112 @@ export class Agent {
       }
       default:
         return `Executing ${name}...`;
+    }
+  }
+
+  /**
+   * Get tool action info for Claude Code style display
+   */
+  private getToolActionInfo(name: string, args: unknown): ToolActionInfo {
+    switch (name) {
+      case "read_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "write_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "edit_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "run_command":
+        return { toolName: name, target: this.extractStringArg(args, "command") || "command" };
+      case "git_commit": {
+        const msg = this.extractStringArg(args, "message");
+        return { toolName: name, target: msg ? `git commit -m "${msg.slice(0, 50)}${msg.length > 50 ? "..." : ""}"` : "git commit" };
+      }
+      case "list_files":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "." };
+      case "search_project": {
+        const pattern = this.extractStringArg(args, "pattern");
+        return { toolName: name, target: pattern ? `"${pattern}"` : "pattern" };
+      }
+      case "web_search": {
+        const query = this.extractStringArg(args, "query");
+        return { toolName: name, target: query ? `"${query}"` : "query" };
+      }
+      case "read_url":
+        return { toolName: name, target: this.extractStringArg(args, "url") || "url" };
+      case "glob_files": {
+        const pattern = this.extractStringArg(args, "pattern");
+        return { toolName: name, target: pattern || "pattern" };
+      }
+      case "multi_edit": {
+        const edits = (args as { edits?: unknown[] })?.edits;
+        const count = Array.isArray(edits) ? edits.length : 0;
+        return { toolName: name, target: `${count} files` };
+      }
+      default:
+        return { toolName: name, target: "" };
+    }
+  }
+
+  /**
+   * Get compact result display for Claude Code style
+   */
+  private getToolResultDisplay(name: string, args: unknown, result: string): string {
+    switch (name) {
+      case "read_file": {
+        const lineCount = result.split("\n").length;
+        return `Read ${lineCount} lines`;
+      }
+      case "write_file": {
+        const path = this.extractStringArg(args, "path") || "file";
+        return `Wrote ${path}`;
+      }
+      case "edit_file": {
+        const path = this.extractStringArg(args, "path") || "file";
+        return `Edited ${path}`;
+      }
+      case "run_command": {
+        if (result.includes("Process exited with code 0") || !result.includes("Process exited with code")) {
+          return "Command completed";
+        }
+        return "Command failed";
+      }
+      case "git_commit":
+        return "Committed changes";
+      case "list_files": {
+        const fileCount = result.split("\n").filter(Boolean).length;
+        return `Found ${fileCount} items`;
+      }
+      case "search_project": {
+        const matchCount = this.countSearchMatches(result);
+        return matchCount ? `Found ${matchCount} matches` : "No matches found";
+      }
+      case "web_search": {
+        const count = this.countSearchResults(result);
+        return count ? `Found ${count} results` : "Search completed";
+      }
+      case "read_url": {
+        const url = this.extractStringArg(args, "url");
+        const host = url ? this.safeHost(url) : "";
+        return host ? `Read content from ${host}` : "Read web content";
+      }
+      case "glob_files": {
+        try {
+          const parsed = JSON.parse(result);
+          return `Found ${parsed.count || 0} files`;
+        } catch {
+          return "Glob completed";
+        }
+      }
+      case "multi_edit": {
+        const successCount = (result.match(/✓/g) || []).length;
+        const failCount = (result.match(/✗/g) || []).length;
+        if (failCount > 0) {
+          return `Edited ${successCount} files, ${failCount} failed`;
+        }
+        return `Edited ${successCount} files`;
+      }
+      default:
+        return "Completed";
     }
   }
 
@@ -883,5 +1187,19 @@ export class Agent {
     if (this.currentAbortController) {
       this.currentAbortController.abort();
     }
+  }
+
+  /**
+   * Set the trust level for tool approvals
+   */
+  setTrustLevel(level: TrustLevel) {
+    this.trustLevel = level;
+  }
+
+  /**
+   * Get the current trust level
+   */
+  getTrustLevel(): TrustLevel {
+    return this.trustLevel;
   }
 }

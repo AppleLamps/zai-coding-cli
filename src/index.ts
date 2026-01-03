@@ -60,10 +60,31 @@ const main = async (options: CliOptions) => {
     compactionService,
     {
       systemPrompt: options.system,
-      onToolStart: (message) => ui.startToolSpinner(message),
-      onToolEnd: (summary) => ui.endToolSpinner(summary)
+      trustLevel: "standard",
+      projectRoot: process.cwd(),
+      // Legacy callbacks (still used for spinner during long operations)
+      onToolStart: (_message) => {
+        // Spinner is now optional - tool action is shown via onToolAction
+      },
+      onToolEnd: (_summary) => {
+        // Result is now shown via onToolResult
+      },
+      // New Claude Code style callbacks
+      onToolAction: (info) => ui.writeToolAction(info.toolName, info.target),
+      onToolResult: (result) => ui.writeToolResult(result)
     }
   );
+
+  // Wire up command callbacks for /undo, /trust, and /backup
+  commandService.setCallbacks({
+    getUndoableFiles: () => agent.getUndoableFiles(),
+    undoFile: (path) => agent.undoFile(path),
+    setTrustLevel: (level) => agent.setTrustLevel(level),
+    getTrustLevel: () => agent.getTrustLevel(),
+    getBackupStats: () => agent.getBackupStats(),
+    getBackupInfo: (path) => agent.getBackupInfo(path),
+    clearBackups: () => agent.clearBackups()
+  });
 
   process.on("SIGINT", () => {
     if (agent.isBusy()) {
