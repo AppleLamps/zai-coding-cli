@@ -18,13 +18,15 @@ import {
 import type { SessionService, SessionState } from "./services/session.service.js";
 import type { TerminalUI } from "./ui/terminal.js";
 
-/**
- * Trust levels for tool approval:
- * - "full": Auto-approve all operations (dangerous, for trusted environments)
- * - "standard": Auto-approve reads/lists, prompt for writes/commands
- * - "paranoid": Prompt for all operations including reads
- */
-export type TrustLevel = "full" | "standard" | "paranoid";
+import {
+  type TrustLevel,
+  type ToolActionInfo,
+  MultiEditArgsSchema,
+  validateToolArgs
+} from "./core/types.js";
+
+// Re-export for backwards compatibility
+export type { TrustLevel };
 
 // Tools that are safe to auto-approve in standard mode
 const SAFE_TOOLS = new Set([
@@ -32,18 +34,14 @@ const SAFE_TOOLS = new Set([
   "list_files",
   "search_project",
   "web_search",
-  "read_url"
+  "read_url",
+  "glob_files"  // Read-only file search
 ]);
 
 // Tools that require approval even in full trust mode (destructive)
 const ALWAYS_PROMPT_TOOLS = new Set<string>([
   // Currently empty, but could include "git_push", "delete_file" etc.
 ]);
-
-type ToolActionInfo = {
-  toolName: string;
-  target: string;
-};
 
 type AgentOptions = {
   systemPrompt?: string;
@@ -349,6 +347,66 @@ export class Agent {
                     content: "User denied the operation."
                   });
                   this.onToolEnd?.("User denied the operation.");
+                  continue;
+                }
+              }
+            }
+
+            // Handle multi_edit with proper backups and approval
+            if (toolName === "multi_edit") {
+              // Validate args at runtime
+              const validation = validateToolArgs(MultiEditArgsSchema, args, "multi_edit");
+              if (!validation.success) {
+                this.messages.push({
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: `Error: ${validation.error}`
+                });
+                this.onToolEnd?.(validation.error);
+                continue;
+              }
+
+              const validatedArgs = validation.data;
+
+              // Backup all files that will be edited
+              for (const edit of validatedArgs.edits) {
+                await this.backupFile(edit.path);
+              }
+
+              // Show preview and get approval if needed
+              if (needsApproval) {
+                const previews = await this.mcp.previewMultiEdit(validatedArgs.edits);
+
+                this.ui.stopSpinner();
+                this.ui.writeSectionHeader(`Multi-Edit: ${validatedArgs.edits.length} files`);
+
+                for (const preview of previews) {
+                  if (preview.error) {
+                    this.ui.writeError(`  ${preview.path}: ${preview.error}`);
+                  } else {
+                    this.ui.writeMuted(`  ${preview.path}:`);
+                    this.ui.writeDiff(preview.diff);
+                  }
+                }
+
+                this.ui.renderPermissionPanel(
+                  "Apply Edits",
+                  `${validatedArgs.edits.length} files`,
+                  "warn"
+                );
+
+                const approved = await confirm({
+                  message: "Apply all edits?",
+                  default: false
+                });
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied multi-edit operation."
+                  });
+                  this.onToolEnd?.("User denied multi-edit operation.");
                   continue;
                 }
               }
