@@ -60,8 +60,16 @@ const main = async (options: CliOptions) => {
     compactionService,
     {
       systemPrompt: options.system,
-      onToolStart: (message) => ui.startToolSpinner(message),
-      onToolEnd: (summary) => ui.endToolSpinner(summary)
+      // Legacy callbacks (still used for spinner during long operations)
+      onToolStart: (_message) => {
+        // Spinner is now optional - tool action is shown via onToolAction
+      },
+      onToolEnd: (_summary) => {
+        // Result is now shown via onToolResult
+      },
+      // New Claude Code style callbacks
+      onToolAction: (info) => ui.writeToolAction(info.toolName, info.target),
+      onToolResult: (result) => ui.writeToolResult(result)
     }
   );
 

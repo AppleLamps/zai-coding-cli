@@ -31,6 +31,19 @@ type BoxOptions = {
   borderColor: string;
 };
 
+// Tool name mapping to Claude Code style
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Edit",
+  run_command: "Bash",
+  list_files: "Glob",
+  search_project: "Grep",
+  git_commit: "Bash",
+  web_search: "WebSearch",
+  read_url: "WebFetch"
+};
+
 export class TerminalUI {
   private rl: readline.Interface;
   private spinner: Ora | null = null;
@@ -208,37 +221,89 @@ export class TerminalUI {
     }
   }
 
-  writeDiff(diff: string, title = "Proposed Edit") {
+  /**
+   * Display a tool action in Claude Code style: • ToolName target
+   */
+  writeToolAction(toolName: string, target: string) {
+    this.stopSpinner();
+    this.hideStatusBar();
+    const displayName = this.formatToolName(toolName);
+    const formattedName = chalk.bold(displayName);
+    console.log(`• ${formattedName} ${chalk.dim(target)}`);
+  }
+
+  /**
+   * Display a tool result in nested tree style: └ result
+   */
+  writeToolResult(result: string) {
+    if (!result) return;
+    this.hideStatusBar();
+    console.log(chalk.dim(`  └ ${result}`));
+  }
+
+  /**
+   * Display multiple lines of tool output in nested tree style
+   */
+  writeToolOutput(lines: string[], maxLines = 4) {
+    if (!lines.length) return;
+    this.hideStatusBar();
+    const visible = lines.slice(0, maxLines);
+    for (let i = 0; i < visible.length; i++) {
+      const prefix = i === 0 ? "└" : " ";
+      console.log(chalk.dim(`  ${prefix} ${visible[i]}`));
+    }
+    if (lines.length > maxLines) {
+      console.log(chalk.dim(`    ... ${lines.length - maxLines} more lines`));
+    }
+  }
+
+  /**
+   * Format tool name to Claude Code style display name
+   */
+  formatToolName(name: string): string {
+    return TOOL_DISPLAY_NAMES[name] || name;
+  }
+
+  writeDiff(diff: string, _title = "Proposed Edit") {
     this.stopSpinner();
     this.hideStatusBar();
     const lines = diff.split(/\r?\n/);
-    const maxLines = this.getDiffLimit();
-    const shouldTruncate = lines.length > maxLines;
-    const visibleLines = shouldTruncate ? lines.slice(0, maxLines) : lines;
-    const rendered = visibleLines
-      .map((line) => {
-        if (line.startsWith("diff ") || line.startsWith("index ")) {
-          return chalk.gray(line);
-        }
-        if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-          return chalk.cyan(line);
-        }
-        if (line.startsWith("@@")) {
-          return chalk.magenta(line);
-        }
-        if (line.startsWith("+")) {
-          return chalk.green(line);
-        }
-        if (line.startsWith("-")) {
-          return chalk.red(line);
-        }
-        return line;
-      })
-      .join("\n");
-    const trailer = shouldTruncate
-      ? `\n${chalk.dim(`... ${lines.length - maxLines} more lines hidden`)}` 
-      : "";
-    this.renderBox(`${rendered}${trailer}`, { title, borderColor: "cyan" });
+    // Show fewer lines by default for compact display
+    const previewLines = this.verbosity === "verbose" ? 20 : 10;
+    const shouldTruncate = lines.length > previewLines;
+    const visibleLines = shouldTruncate ? lines.slice(0, previewLines) : lines;
+
+    // Render inline without box, just indented colored lines
+    for (const line of visibleLines) {
+      console.log(`  ${this.colorDiffLine(line)}`);
+    }
+
+    if (shouldTruncate) {
+      const remaining = lines.length - previewLines;
+      console.log(chalk.dim(`    Show full diff (${remaining} more lines)`));
+    }
+  }
+
+  /**
+   * Color a single diff line based on its prefix
+   */
+  private colorDiffLine(line: string): string {
+    if (line.startsWith("diff ") || line.startsWith("index ")) {
+      return chalk.gray(line);
+    }
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      return chalk.cyan(line);
+    }
+    if (line.startsWith("@@")) {
+      return chalk.magenta(line);
+    }
+    if (line.startsWith("+")) {
+      return chalk.green(line);
+    }
+    if (line.startsWith("-")) {
+      return chalk.red(line);
+    }
+    return line;
   }
 
   writeTokenUsage(
@@ -267,36 +332,40 @@ export class TerminalUI {
     this.renderStatusBar();
   }
 
-  writeCommandOutput(output: string, maxLines = 4) {
+  writeCommandOutput(output: string, maxLines = 6) {
     this.stopSpinner();
     const trimmed = output.trimEnd();
     if (!trimmed) {
       return;
     }
     const isError = /Process exited with code|timed out|aborted/i.test(trimmed);
-    if (this.verbosity === "minimal") {
-      return;
-    }
-    if (this.verbosity === "normal" && !isError) {
+    if (this.verbosity === "minimal" && !isError) {
       return;
     }
     const lines = trimmed.split(/\r?\n/);
-    const lineLimit = this.verbosity === "verbose" ? maxLines : Math.min(4, maxLines);
+    const lineLimit = this.verbosity === "verbose" ? maxLines * 2 : maxLines;
     const charLimit = this.verbosity === "verbose" ? 4000 : 1200;
-    const visible = lines.slice(0, lineLimit);
+
+    // Take last N lines (most relevant for command output)
+    let visible = lines.slice(-lineLimit);
     let content = visible.join("\n");
     let truncated = lines.length > lineLimit;
+
     if (content.length > charLimit) {
       content = content.slice(0, charLimit);
       truncated = true;
     }
-    if (truncated) {
-      content = `${content}\n... (output truncated)`;
+
+    // Render in nested tree style
+    const outputLines = content.split(/\r?\n/);
+    for (let i = 0; i < outputLines.length; i++) {
+      const prefix = i === 0 ? "└" : " ";
+      console.log(chalk.dim(`  ${prefix} ${outputLines[i]}`));
     }
-    this.renderBox(chalk.gray(content), {
-      title: "Command Output",
-      borderColor: "red"
-    });
+
+    if (truncated) {
+      console.log(chalk.dim(`    ... (${lines.length - lineLimit} more lines)`));
+    }
   }
 
   writeHistoryMessage(role: "user" | "assistant", content: string) {
@@ -311,16 +380,25 @@ export class TerminalUI {
   renderPermissionPanel(title: string, body: string, tone: PanelTone) {
     this.stopSpinner();
     this.hideStatusBar();
-    const borderColor =
+
+    // Use inline format with warning indicator
+    const icon =
       tone === "danger"
-        ? "red"
-        : tone === "safe"
-          ? "green"
-          : tone === "warn"
-            ? "yellow"
-            : "blue";
-    const content = chalk.yellow(body);
-    this.renderBox(content, { title, borderColor });
+        ? chalk.red("⚠")
+        : tone === "warn"
+          ? chalk.yellow("⚠")
+          : tone === "safe"
+            ? chalk.green("→")
+            : chalk.blue("•");
+
+    const label =
+      tone === "danger"
+        ? chalk.red(title)
+        : tone === "warn"
+          ? chalk.yellow(title)
+          : chalk.cyan(title);
+
+    console.log(`  ${icon} ${label}: ${chalk.dim(body)}`);
   }
 
   setStatusNotice(message: string, ttlMs = 2200) {

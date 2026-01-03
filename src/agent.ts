@@ -18,10 +18,17 @@ import {
 import type { SessionService, SessionState } from "./services/session.service.js";
 import type { TerminalUI } from "./ui/terminal.js";
 
+type ToolActionInfo = {
+  toolName: string;
+  target: string;
+};
+
 type AgentOptions = {
   systemPrompt?: string;
   onToolStart?: (message: string) => void;
   onToolEnd?: (message: string) => void;
+  onToolAction?: (info: ToolActionInfo) => void;
+  onToolResult?: (result: string) => void;
 };
 
 type FunctionToolCall = Extract<
@@ -41,6 +48,8 @@ export class Agent {
   private messages: ChatCompletionMessageParam[];
   private onToolStart?: (message: string) => void;
   private onToolEnd?: (message: string) => void;
+  private onToolAction?: (info: ToolActionInfo) => void;
+  private onToolResult?: (result: string) => void;
   private systemPromptOverride?: string;
   private isBusyFlag = false;
   private cancelRequested = false;
@@ -67,6 +76,8 @@ export class Agent {
     this.compactionService = compactionService;
     this.onToolStart = options.onToolStart;
     this.onToolEnd = options.onToolEnd;
+    this.onToolAction = options.onToolAction;
+    this.onToolResult = options.onToolResult;
     this.systemPromptOverride = options.systemPrompt;
     this.messages = [];
   }
@@ -235,6 +246,9 @@ export class Agent {
               }
             }
 
+            // Display tool action in Claude Code style
+            const actionInfo = this.getToolActionInfo(toolName, args);
+            this.onToolAction?.(actionInfo);
             this.onToolStart?.(startMessage);
 
             let result = "";
@@ -260,6 +274,11 @@ export class Agent {
             if (toolName === "run_command") {
               this.ui.writeCommandOutput(result);
             }
+
+            // Display result in Claude Code style
+            const resultDisplay = this.getToolResultDisplay(toolName, args, sanitizedResult);
+            this.onToolResult?.(resultDisplay);
+
             const summary = this.summarizeToolResult(
               toolName,
               args,
@@ -497,6 +516,87 @@ export class Agent {
       }
       default:
         return `Executing ${name}...`;
+    }
+  }
+
+  /**
+   * Get tool action info for Claude Code style display
+   */
+  private getToolActionInfo(name: string, args: unknown): ToolActionInfo {
+    switch (name) {
+      case "read_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "write_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "edit_file":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "file" };
+      case "run_command":
+        return { toolName: name, target: this.extractStringArg(args, "command") || "command" };
+      case "git_commit": {
+        const msg = this.extractStringArg(args, "message");
+        return { toolName: name, target: msg ? `git commit -m "${msg.slice(0, 50)}${msg.length > 50 ? "..." : ""}"` : "git commit" };
+      }
+      case "list_files":
+        return { toolName: name, target: this.extractStringArg(args, "path") || "." };
+      case "search_project": {
+        const pattern = this.extractStringArg(args, "pattern");
+        return { toolName: name, target: pattern ? `"${pattern}"` : "pattern" };
+      }
+      case "web_search": {
+        const query = this.extractStringArg(args, "query");
+        return { toolName: name, target: query ? `"${query}"` : "query" };
+      }
+      case "read_url":
+        return { toolName: name, target: this.extractStringArg(args, "url") || "url" };
+      default:
+        return { toolName: name, target: "" };
+    }
+  }
+
+  /**
+   * Get compact result display for Claude Code style
+   */
+  private getToolResultDisplay(name: string, args: unknown, result: string): string {
+    switch (name) {
+      case "read_file": {
+        const lineCount = result.split("\n").length;
+        return `Read ${lineCount} lines`;
+      }
+      case "write_file": {
+        const path = this.extractStringArg(args, "path") || "file";
+        return `Wrote ${path}`;
+      }
+      case "edit_file": {
+        const path = this.extractStringArg(args, "path") || "file";
+        return `Edited ${path}`;
+      }
+      case "run_command": {
+        if (result.includes("Process exited with code 0") || !result.includes("Process exited with code")) {
+          return "Command completed";
+        }
+        return "Command failed";
+      }
+      case "git_commit":
+        return "Committed changes";
+      case "list_files": {
+        const fileCount = result.split("\n").filter(Boolean).length;
+        return `Found ${fileCount} items`;
+      }
+      case "search_project": {
+        const matchCount = this.countSearchMatches(result);
+        return matchCount ? `Found ${matchCount} matches` : "No matches found";
+      }
+      case "web_search": {
+        const count = this.countSearchResults(result);
+        return count ? `Found ${count} results` : "Search completed";
+      }
+      case "read_url": {
+        const url = this.extractStringArg(args, "url");
+        const host = url ? this.safeHost(url) : "";
+        return host ? `Read content from ${host}` : "Read web content";
+      }
+      default:
+        return "Completed";
     }
   }
 
