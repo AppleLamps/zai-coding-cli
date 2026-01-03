@@ -100,6 +100,107 @@ export class FSService {
     };
   }
 
+  /**
+   * Find files matching a glob pattern
+   */
+  async globFiles(args: { pattern: string; path?: string }): Promise<string> {
+    const basePath = args.path
+      ? await this.resolvePath(args.path)
+      : this.rootDir;
+    const pattern = args.pattern;
+    const ig = await this.buildIgnore();
+    const matches: string[] = [];
+
+    await this.walkGlob(basePath, pattern, ig, matches);
+
+    if (matches.length === 0) {
+      return JSON.stringify({
+        pattern,
+        basePath: this.toRelative(basePath),
+        matches: [],
+        count: 0
+      });
+    }
+
+    // Sort by modification time (newest first)
+    const withStats = await Promise.all(
+      matches.map(async (filePath) => {
+        try {
+          const stats = await fs.stat(filePath);
+          return { path: this.toRelative(filePath), mtime: stats.mtime.getTime() };
+        } catch {
+          return { path: this.toRelative(filePath), mtime: 0 };
+        }
+      })
+    );
+
+    withStats.sort((a, b) => b.mtime - a.mtime);
+
+    return JSON.stringify({
+      pattern,
+      basePath: this.toRelative(basePath),
+      matches: withStats.map((f) => f.path),
+      count: withStats.length
+    });
+  }
+
+  /**
+   * Walk directory and match files against glob pattern
+   */
+  private async walkGlob(
+    dir: string,
+    pattern: string,
+    ig: Ignore,
+    matches: string[],
+    maxMatches = 500
+  ): Promise<void> {
+    if (matches.length >= maxMatches) return;
+
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (matches.length >= maxMatches) break;
+
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = this.toRelative(fullPath);
+
+        if (ig.ignores(relativePath)) continue;
+
+        if (entry.isDirectory()) {
+          await this.walkGlob(fullPath, pattern, ig, matches, maxMatches);
+        } else if (entry.isFile()) {
+          if (this.matchGlob(relativePath, pattern)) {
+            matches.push(fullPath);
+          }
+        }
+      }
+    } catch {
+      // Skip directories we can't read
+    }
+  }
+
+  /**
+   * Simple glob matching (supports *, **, ?)
+   */
+  private matchGlob(filePath: string, pattern: string): boolean {
+    // Convert glob pattern to regex
+    let regexPattern = pattern
+      .replace(/\./g, "\\.")
+      .replace(/\*\*/g, "{{GLOBSTAR}}")
+      .replace(/\*/g, "[^/]*")
+      .replace(/\?/g, ".")
+      .replace(/{{GLOBSTAR}}/g, ".*");
+
+    // Handle patterns that don't start with ** or path
+    if (!pattern.startsWith("*") && !pattern.startsWith("/")) {
+      regexPattern = `(^|/)${regexPattern}`;
+    }
+
+    const regex = new RegExp(`${regexPattern}$`, "i");
+    return regex.test(filePath);
+  }
+
   async generateFileTree(maxDepth = 3) {
     const ig = await this.buildIgnore();
     const fileCount = await this.countFiles(this.rootDir, ig, 501);

@@ -18,6 +18,28 @@ import {
 import type { SessionService, SessionState } from "./services/session.service.js";
 import type { TerminalUI } from "./ui/terminal.js";
 
+/**
+ * Trust levels for tool approval:
+ * - "full": Auto-approve all operations (dangerous, for trusted environments)
+ * - "standard": Auto-approve reads/lists, prompt for writes/commands
+ * - "paranoid": Prompt for all operations including reads
+ */
+export type TrustLevel = "full" | "standard" | "paranoid";
+
+// Tools that are safe to auto-approve in standard mode
+const SAFE_TOOLS = new Set([
+  "read_file",
+  "list_files",
+  "search_project",
+  "web_search",
+  "read_url"
+]);
+
+// Tools that require approval even in full trust mode (destructive)
+const ALWAYS_PROMPT_TOOLS = new Set<string>([
+  // Currently empty, but could include "git_push", "delete_file" etc.
+]);
+
 type ToolActionInfo = {
   toolName: string;
   target: string;
@@ -25,10 +47,12 @@ type ToolActionInfo = {
 
 type AgentOptions = {
   systemPrompt?: string;
+  trustLevel?: TrustLevel;
   onToolStart?: (message: string) => void;
   onToolEnd?: (message: string) => void;
   onToolAction?: (info: ToolActionInfo) => void;
   onToolResult?: (result: string) => void;
+  onThinking?: (thought: string) => void;
 };
 
 type FunctionToolCall = Extract<
@@ -50,7 +74,10 @@ export class Agent {
   private onToolEnd?: (message: string) => void;
   private onToolAction?: (info: ToolActionInfo) => void;
   private onToolResult?: (result: string) => void;
+  private onThinking?: (thought: string) => void;
   private systemPromptOverride?: string;
+  private trustLevel: TrustLevel;
+  private fileBackups: Map<string, string> = new Map();
   private isBusyFlag = false;
   private cancelRequested = false;
   private currentAbortController: AbortController | null = null;
@@ -78,8 +105,69 @@ export class Agent {
     this.onToolEnd = options.onToolEnd;
     this.onToolAction = options.onToolAction;
     this.onToolResult = options.onToolResult;
+    this.onThinking = options.onThinking;
     this.systemPromptOverride = options.systemPrompt;
+    this.trustLevel = options.trustLevel ?? "standard";
     this.messages = [];
+  }
+
+  /**
+   * Check if a tool requires user approval based on trust level
+   */
+  private requiresApproval(toolName: string): boolean {
+    // Always prompt for destructive tools
+    if (ALWAYS_PROMPT_TOOLS.has(toolName)) {
+      return true;
+    }
+
+    switch (this.trustLevel) {
+      case "full":
+        return false;
+      case "paranoid":
+        return true;
+      case "standard":
+      default:
+        return !SAFE_TOOLS.has(toolName);
+    }
+  }
+
+  /**
+   * Backup a file before modification for undo capability
+   */
+  private async backupFile(filePath: string): Promise<void> {
+    try {
+      const content = await this.mcp.executeTool("read_file", { path: filePath });
+      this.fileBackups.set(filePath, content);
+    } catch {
+      // File doesn't exist yet, no backup needed
+    }
+  }
+
+  /**
+   * Restore a file from backup
+   */
+  async undoFile(filePath: string): Promise<boolean> {
+    const backup = this.fileBackups.get(filePath);
+    if (backup === undefined) {
+      return false;
+    }
+    await this.mcp.executeTool("write_file", { path: filePath, content: backup });
+    this.fileBackups.delete(filePath);
+    return true;
+  }
+
+  /**
+   * Get list of files that can be undone
+   */
+  getUndoableFiles(): string[] {
+    return Array.from(this.fileBackups.keys());
+  }
+
+  /**
+   * Clear all file backups
+   */
+  clearBackups(): void {
+    this.fileBackups.clear();
   }
 
   async run() {
@@ -144,7 +232,11 @@ export class Agent {
               break;
             }
 
-            if (toolName === "run_command") {
+            // Check if this tool requires approval based on trust level
+            const needsApproval = this.requiresApproval(toolName);
+
+            // Handle approval for dangerous operations
+            if (needsApproval && toolName === "run_command") {
               this.ui.stopSpinner();
               const command = this.extractStringArg(args, "command");
               this.ui.renderPermissionPanel(
@@ -168,7 +260,7 @@ export class Agent {
               }
             }
 
-            if (toolName === "git_commit") {
+            if (needsApproval && toolName === "git_commit") {
               this.ui.stopSpinner();
               const message = this.extractStringArg(args, "message");
               this.ui.renderPermissionPanel(
@@ -193,56 +285,72 @@ export class Agent {
             }
 
             if (toolName === "write_file") {
-              const preview = await this.mcp.previewWriteFile(
-                args as { path?: string; content?: string }
-              );
-              this.ui.stopSpinner();
-              this.ui.writeDiff(preview.diff, "Proposed Edit");
-              const target = this.extractStringArg(args, "path") || "file";
-              this.ui.renderPermissionPanel("Apply Edit", target, "safe");
+              const filePath = this.extractStringArg(args, "path");
+              // Backup file before modification for undo capability
+              if (filePath) {
+                await this.backupFile(filePath);
+              }
 
-              const approved = await confirm({
-                message: "Apply this edit?",
-                default: false
-              });
+              if (needsApproval) {
+                const preview = await this.mcp.previewWriteFile(
+                  args as { path?: string; content?: string }
+                );
+                this.ui.stopSpinner();
+                this.ui.writeDiff(preview.diff, "Proposed Edit");
+                const target = filePath || "file";
+                this.ui.renderPermissionPanel("Apply Edit", target, "safe");
 
-              if (!approved) {
-                this.messages.push({
-                  role: "tool",
-                  tool_call_id: toolCall.id,
-                  content: "User denied the operation."
+                const approved = await confirm({
+                  message: "Apply this edit?",
+                  default: false
                 });
-                this.onToolEnd?.("User denied the operation.");
-                continue;
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied the operation."
+                  });
+                  this.onToolEnd?.("User denied the operation.");
+                  continue;
+                }
               }
             }
 
             if (toolName === "edit_file") {
-              const preview = await this.mcp.previewEditFile(
-                args as {
-                  path?: string;
-                  old_string?: string;
-                  new_string?: string;
-                }
-              );
-              this.ui.stopSpinner();
-              this.ui.writeDiff(preview.diff, "Proposed Edit");
-              const target = this.extractStringArg(args, "path") || "file";
-              this.ui.renderPermissionPanel("Apply Edit", target, "safe");
+              const filePath = this.extractStringArg(args, "path");
+              // Backup file before modification for undo capability
+              if (filePath) {
+                await this.backupFile(filePath);
+              }
 
-              const approved = await confirm({
-                message: "Apply this edit?",
-                default: false
-              });
+              if (needsApproval) {
+                const preview = await this.mcp.previewEditFile(
+                  args as {
+                    path?: string;
+                    old_string?: string;
+                    new_string?: string;
+                  }
+                );
+                this.ui.stopSpinner();
+                this.ui.writeDiff(preview.diff, "Proposed Edit");
+                const target = filePath || "file";
+                this.ui.renderPermissionPanel("Apply Edit", target, "safe");
 
-              if (!approved) {
-                this.messages.push({
-                  role: "tool",
-                  tool_call_id: toolCall.id,
-                  content: "User denied the operation."
+                const approved = await confirm({
+                  message: "Apply this edit?",
+                  default: false
                 });
-                this.onToolEnd?.("User denied the operation.");
-                continue;
+
+                if (!approved) {
+                  this.messages.push({
+                    role: "tool",
+                    tool_call_id: toolCall.id,
+                    content: "User denied the operation."
+                  });
+                  this.onToolEnd?.("User denied the operation.");
+                  continue;
+                }
               }
             }
 
@@ -548,6 +656,15 @@ export class Agent {
       }
       case "read_url":
         return { toolName: name, target: this.extractStringArg(args, "url") || "url" };
+      case "glob_files": {
+        const pattern = this.extractStringArg(args, "pattern");
+        return { toolName: name, target: pattern || "pattern" };
+      }
+      case "multi_edit": {
+        const edits = (args as { edits?: unknown[] })?.edits;
+        const count = Array.isArray(edits) ? edits.length : 0;
+        return { toolName: name, target: `${count} files` };
+      }
       default:
         return { toolName: name, target: "" };
     }
@@ -594,6 +711,22 @@ export class Agent {
         const url = this.extractStringArg(args, "url");
         const host = url ? this.safeHost(url) : "";
         return host ? `Read content from ${host}` : "Read web content";
+      }
+      case "glob_files": {
+        try {
+          const parsed = JSON.parse(result);
+          return `Found ${parsed.count || 0} files`;
+        } catch {
+          return "Glob completed";
+        }
+      }
+      case "multi_edit": {
+        const successCount = (result.match(/✓/g) || []).length;
+        const failCount = (result.match(/✗/g) || []).length;
+        if (failCount > 0) {
+          return `Edited ${successCount} files, ${failCount} failed`;
+        }
+        return `Edited ${successCount} files`;
       }
       default:
         return "Completed";
@@ -983,5 +1116,19 @@ export class Agent {
     if (this.currentAbortController) {
       this.currentAbortController.abort();
     }
+  }
+
+  /**
+   * Set the trust level for tool approvals
+   */
+  setTrustLevel(level: TrustLevel) {
+    this.trustLevel = level;
+  }
+
+  /**
+   * Get the current trust level
+   */
+  getTrustLevel(): TrustLevel {
+    return this.trustLevel;
   }
 }

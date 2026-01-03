@@ -60,6 +60,7 @@ const main = async (options: CliOptions) => {
     compactionService,
     {
       systemPrompt: options.system,
+      trustLevel: "standard",
       // Legacy callbacks (still used for spinner during long operations)
       onToolStart: (_message) => {
         // Spinner is now optional - tool action is shown via onToolAction
@@ -69,9 +70,18 @@ const main = async (options: CliOptions) => {
       },
       // New Claude Code style callbacks
       onToolAction: (info) => ui.writeToolAction(info.toolName, info.target),
-      onToolResult: (result) => ui.writeToolResult(result)
+      onToolResult: (result) => ui.writeToolResult(result),
+      onThinking: (thought) => ui.writeThinking(thought)
     }
   );
+
+  // Wire up command callbacks for /undo and /trust
+  commandService.setCallbacks({
+    getUndoableFiles: () => agent.getUndoableFiles(),
+    undoFile: (path) => agent.undoFile(path),
+    setTrustLevel: (level) => agent.setTrustLevel(level),
+    getTrustLevel: () => agent.getTrustLevel()
+  });
 
   process.on("SIGINT", () => {
     if (agent.isBusy()) {

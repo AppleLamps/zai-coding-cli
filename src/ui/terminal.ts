@@ -36,8 +36,10 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   read_file: "Read",
   write_file: "Write",
   edit_file: "Edit",
+  multi_edit: "MultiEdit",
   run_command: "Bash",
-  list_files: "Glob",
+  list_files: "List",
+  glob_files: "Glob",
   search_project: "Grep",
   git_commit: "Bash",
   web_search: "WebSearch",
@@ -230,6 +232,28 @@ export class TerminalUI {
     const displayName = this.formatToolName(toolName);
     const formattedName = chalk.bold(displayName);
     console.log(`• ${formattedName} ${chalk.dim(target)}`);
+  }
+
+  /**
+   * Display agent thinking/reasoning in a subtle way
+   */
+  writeThinking(thought: string) {
+    this.stopSpinner();
+    this.hideStatusBar();
+    // Show thinking in italic gray with a thought bubble indicator
+    const lines = thought.split("\n");
+    for (const line of lines) {
+      console.log(chalk.gray.italic(`  💭 ${line}`));
+    }
+  }
+
+  /**
+   * Display a section header
+   */
+  writeSectionHeader(title: string) {
+    this.stopSpinner();
+    this.hideStatusBar();
+    console.log(chalk.cyan.bold(`\n─── ${title} ───`));
   }
 
   /**
