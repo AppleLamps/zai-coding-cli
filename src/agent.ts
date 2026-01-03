@@ -17,6 +17,7 @@ import {
 } from "./services/llm.service.js";
 import type { SessionService, SessionState } from "./services/session.service.js";
 import type { TerminalUI } from "./ui/terminal.js";
+import { BackupService } from "./services/backup.service.js";
 
 import {
   type TrustLevel,
@@ -46,6 +47,7 @@ const ALWAYS_PROMPT_TOOLS = new Set<string>([
 type AgentOptions = {
   systemPrompt?: string;
   trustLevel?: TrustLevel;
+  projectRoot?: string;
   onToolStart?: (message: string) => void;
   onToolEnd?: (message: string) => void;
   onToolAction?: (info: ToolActionInfo) => void;
@@ -75,7 +77,7 @@ export class Agent {
   private onThinking?: (thought: string) => void;
   private systemPromptOverride?: string;
   private trustLevel: TrustLevel;
-  private fileBackups: Map<string, string> = new Map();
+  private backupService: BackupService;
   private isBusyFlag = false;
   private cancelRequested = false;
   private currentAbortController: AbortController | null = null;
@@ -106,6 +108,7 @@ export class Agent {
     this.onThinking = options.onThinking;
     this.systemPromptOverride = options.systemPrompt;
     this.trustLevel = options.trustLevel ?? "standard";
+    this.backupService = new BackupService(options.projectRoot ?? process.cwd());
     this.messages = [];
   }
 
@@ -135,7 +138,7 @@ export class Agent {
   private async backupFile(filePath: string): Promise<void> {
     try {
       const content = await this.mcp.executeTool("read_file", { path: filePath });
-      this.fileBackups.set(filePath, content);
+      await this.backupService.backup(filePath, content);
     } catch {
       // File doesn't exist yet, no backup needed
     }
@@ -145,12 +148,11 @@ export class Agent {
    * Restore a file from backup
    */
   async undoFile(filePath: string): Promise<boolean> {
-    const backup = this.fileBackups.get(filePath);
-    if (backup === undefined) {
+    const content = await this.backupService.restore(filePath);
+    if (content === null) {
       return false;
     }
-    await this.mcp.executeTool("write_file", { path: filePath, content: backup });
-    this.fileBackups.delete(filePath);
+    await this.mcp.executeTool("write_file", { path: filePath, content });
     return true;
   }
 
@@ -158,14 +160,28 @@ export class Agent {
    * Get list of files that can be undone
    */
   getUndoableFiles(): string[] {
-    return Array.from(this.fileBackups.keys());
+    return this.backupService.getUndoableFiles();
   }
 
   /**
    * Clear all file backups
    */
-  clearBackups(): void {
-    this.fileBackups.clear();
+  async clearBackups(): Promise<void> {
+    await this.backupService.clearAll();
+  }
+
+  /**
+   * Get backup statistics
+   */
+  getBackupStats() {
+    return this.backupService.getStats();
+  }
+
+  /**
+   * Get backup info for a specific file
+   */
+  getBackupInfo(filePath: string) {
+    return this.backupService.getBackupInfo(filePath);
   }
 
   async run() {

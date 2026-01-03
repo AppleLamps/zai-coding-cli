@@ -1,5 +1,5 @@
 import type { ContextService } from "./context.service.js";
-import type { TrustLevel } from "../agent.js";
+import type { TrustLevel } from "../core/types.js";
 
 type CommandAction = "clear_history" | "reset_all" | "set_trust" | "undo_file" | "undo_all";
 type CommandStatus = "success" | "error" | "info";
@@ -12,12 +12,26 @@ type CommandResult = {
   data?: unknown;
 };
 
+type BackupStats = {
+  fileCount: number;
+  totalSize: number;
+  maxSize: number;
+};
+
+type BackupInfo = {
+  count: number;
+  timestamps: number[];
+};
+
 type CommandCallbacks = {
   getUndoableFiles?: () => string[];
   undoFile?: (path: string) => Promise<boolean>;
   undoAll?: () => Promise<number>;
   setTrustLevel?: (level: TrustLevel) => void;
   getTrustLevel?: () => TrustLevel;
+  getBackupStats?: () => BackupStats;
+  getBackupInfo?: (path: string) => BackupInfo | null;
+  clearBackups?: () => Promise<void>;
 };
 
 export class CommandService {
@@ -146,6 +160,63 @@ export class CommandService {
           status: "success",
           message: `Trust level set to: ${level}`
         };
+      case "/backup": {
+        if (!this.callbacks.getBackupStats) {
+          return { status: "error", message: "Backup system not available." };
+        }
+
+        const subCmd = rest[0]?.toLowerCase();
+
+        if (subCmd === "stats") {
+          const stats = this.callbacks.getBackupStats();
+          const sizeKB = (stats.totalSize / 1024).toFixed(1);
+          const maxMB = (stats.maxSize / 1024 / 1024).toFixed(0);
+          return {
+            status: "info",
+            lines: [
+              "Backup Statistics:",
+              `  Files: ${stats.fileCount}`,
+              `  Size: ${sizeKB} KB / ${maxMB} MB`
+            ]
+          };
+        }
+
+        if (subCmd === "clear") {
+          if (!this.callbacks.clearBackups) {
+            return { status: "error", message: "Clear backups not available." };
+          }
+          await this.callbacks.clearBackups();
+          return { status: "success", message: "All backups cleared." };
+        }
+
+        if (subCmd === "info" && rest[1]) {
+          if (!this.callbacks.getBackupInfo) {
+            return { status: "error", message: "Backup info not available." };
+          }
+          const info = this.callbacks.getBackupInfo(rest[1]);
+          if (!info) {
+            return { status: "error", message: `No backups for ${rest[1]}` };
+          }
+          return {
+            status: "info",
+            lines: [
+              `Backups for ${rest[1]}:`,
+              `  Count: ${info.count}`,
+              "  Timestamps:",
+              ...info.timestamps.map((t) => `    - ${new Date(t).toISOString()}`)
+            ]
+          };
+        }
+
+        return {
+          status: "info",
+          lines: [
+            "/backup stats       Show backup statistics",
+            "/backup info <path> Show backup info for file",
+            "/backup clear       Clear all backups"
+          ]
+        };
+      }
       case "/help":
         return {
           status: "info",
@@ -157,6 +228,7 @@ export class CommandService {
             "/reset        Clear chat history and context",
             "/undo [path]  Undo file changes (list or restore)",
             "/trust [lvl]  Set trust level (full/standard/paranoid)",
+            "/backup       Manage file backups",
             "/help         Show this help",
             "",
             "Tip: Shift+Tab toggles PLAN/ACT mode"

@@ -61,6 +61,7 @@ const main = async (options: CliOptions) => {
     {
       systemPrompt: options.system,
       trustLevel: "standard",
+      projectRoot: process.cwd(),
       // Legacy callbacks (still used for spinner during long operations)
       onToolStart: (_message) => {
         // Spinner is now optional - tool action is shown via onToolAction
@@ -75,12 +76,15 @@ const main = async (options: CliOptions) => {
     }
   );
 
-  // Wire up command callbacks for /undo and /trust
+  // Wire up command callbacks for /undo, /trust, and /backup
   commandService.setCallbacks({
     getUndoableFiles: () => agent.getUndoableFiles(),
     undoFile: (path) => agent.undoFile(path),
     setTrustLevel: (level) => agent.setTrustLevel(level),
-    getTrustLevel: () => agent.getTrustLevel()
+    getTrustLevel: () => agent.getTrustLevel(),
+    getBackupStats: () => agent.getBackupStats(),
+    getBackupInfo: (path) => agent.getBackupInfo(path),
+    clearBackups: () => agent.clearBackups()
   });
 
   process.on("SIGINT", () => {
