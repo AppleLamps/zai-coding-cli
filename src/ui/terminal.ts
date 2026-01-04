@@ -550,15 +550,70 @@ export class TerminalUI {
       return;
     }
 
-    if (trimmed.startsWith("#")) {
-      process.stdout.write(chalk.bold(line) + "\n");
-      return;
+    // Apply inline formatting then output
+    let formatted = this.formatInlineMarkdown(line);
+
+    // Headers - cyan and bold
+    if (trimmed.startsWith("####")) {
+      formatted = chalk.cyan(this.formatInlineMarkdown(line.replace(/^(\s*)####\s*/, "$1")));
+    } else if (trimmed.startsWith("###")) {
+      formatted = chalk.cyan.bold(this.formatInlineMarkdown(line.replace(/^(\s*)###\s*/, "$1")));
+    } else if (trimmed.startsWith("##")) {
+      formatted = chalk.cyan.bold(this.formatInlineMarkdown(line.replace(/^(\s*)##\s*/, "$1")));
+    } else if (trimmed.startsWith("#")) {
+      formatted = chalk.cyan.bold.underline(this.formatInlineMarkdown(line.replace(/^(\s*)#\s*/, "$1")));
     }
-    if (trimmed.startsWith(">")) {
-      process.stdout.write(chalk.gray(line) + "\n");
-      return;
+    // Blockquotes - gray italic
+    else if (trimmed.startsWith(">")) {
+      formatted = chalk.gray.italic(this.formatInlineMarkdown(line.replace(/^(\s*)>\s*/, "$1")));
     }
-    process.stdout.write(line + "\n");
+    // Horizontal rules
+    else if (/^(\s*)[-*_]{3,}\s*$/.test(line)) {
+      formatted = chalk.dim("─".repeat(Math.min(40, process.stdout.columns || 80)));
+    }
+    // Unordered lists - bullet with color
+    else if (/^(\s*)[-*]\s+/.test(line)) {
+      const match = line.match(/^(\s*)[-*]\s+(.*)$/);
+      if (match) {
+        const indent = match[1];
+        const content = this.formatInlineMarkdown(match[2]);
+        formatted = `${indent}${chalk.cyan("•")} ${content}`;
+      }
+    }
+    // Ordered lists - number with color
+    else if (/^(\s*)\d+\.\s+/.test(line)) {
+      const match = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+      if (match) {
+        const indent = match[1];
+        const num = match[2];
+        const content = this.formatInlineMarkdown(match[3]);
+        formatted = `${indent}${chalk.cyan(num + ".")} ${content}`;
+      }
+    }
+
+    process.stdout.write(formatted + "\n");
+  }
+
+  /**
+   * Format inline markdown: **bold**, *italic*, `code`, ~~strikethrough~~
+   */
+  private formatInlineMarkdown(text: string): string {
+    // Inline code - must be done first to avoid formatting inside code
+    text = text.replace(/`([^`]+)`/g, (_, code) => chalk.yellow(code));
+
+    // Bold + italic (***text***)
+    text = text.replace(/\*\*\*([^*]+)\*\*\*/g, (_, content) => chalk.bold.italic(content));
+
+    // Bold (**text**)
+    text = text.replace(/\*\*([^*]+)\*\*/g, (_, content) => chalk.bold(content));
+
+    // Italic (*text*)
+    text = text.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, (_, content) => chalk.italic(content));
+
+    // Strikethrough (~~text~~)
+    text = text.replace(/~~([^~]+)~~/g, (_, content) => chalk.strikethrough(content));
+
+    return text;
   }
 
   private flushCodeBlock() {
